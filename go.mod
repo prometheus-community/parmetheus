@@ -103,6 +103,7 @@ require (
 )
 
 require (
+	github.com/andybalholm/brotli v1.1.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.4 // indirect
 	github.com/go-openapi/swag/cmdutils v0.25.4 // indirect
 	github.com/go-openapi/swag/conv v0.25.4 // indirect
@@ -115,6 +116,10 @@ require (
 	github.com/go-openapi/swag/stringutils v0.25.4 // indirect
 	github.com/go-openapi/swag/typeutils v0.25.4 // indirect
 	github.com/go-openapi/swag/yamlutils v0.25.4 // indirect
+	github.com/parquet-go/bitpack v1.0.0 // indirect
+	github.com/parquet-go/jsonlite v1.0.0 // indirect
+	github.com/parquet-go/parquet-go v0.26.3 // indirect
+	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
 )
