@@ -16,8 +16,6 @@ package promparquet
 import (
 	"context"
 	"fmt"
-	"iter"
-	"maps"
 	"slices"
 	"sync"
 
@@ -39,10 +37,6 @@ type Materializer struct {
 	concurrency int
 
 	dataColToIndex []int
-
-	rowCountQuota   *Quota
-	chunkBytesQuota *Quota
-	dataBytesQuota  *Quota
 
 	materializedSeriesCallback       MaterializedSeriesFunc
 	materializedLabelsFilterCallback MaterializedLabelsFilterCallback
@@ -78,9 +72,6 @@ func NewMaterializer(s *TSDBSchema,
 	d *PrometheusParquetChunksDecoder,
 	block ParquetShard,
 	concurrency int,
-	rowCountQuota *Quota,
-	chunkBytesQuota *Quota,
-	dataBytesQuota *Quota,
 	materializeSeriesCallback MaterializedSeriesFunc,
 	materializeLabelsFilterCallback MaterializedLabelsFilterCallback,
 	honorProjectionHints bool,
@@ -108,9 +99,6 @@ func NewMaterializer(s *TSDBSchema,
 		concurrency:                      concurrency,
 		partitioner:                      NewGapBasedPartitioner(block.ChunksFile().PagePartitioningMaxGapSize()),
 		dataColToIndex:                   dataColToIndex,
-		rowCountQuota:                    rowCountQuota,
-		chunkBytesQuota:                  chunkBytesQuota,
-		dataBytesQuota:                   dataBytesQuota,
 		materializedSeriesCallback:       materializeSeriesCallback,
 		materializedLabelsFilterCallback: materializeLabelsFilterCallback,
 		honorProjectionHints:             honorProjectionHints,
@@ -119,9 +107,6 @@ func NewMaterializer(s *TSDBSchema,
 
 // Materialize reconstructs the ChunkSeries that belong to the specified row ranges (rr).
 func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.SelectHints, rgi int, mint, maxt int64, skipChunks bool, rr []RowRange) (ChunkSeriesSetCloser, error) {
-	if err := m.checkRowCountQuota(rr); err != nil {
-		return nil, err
-	}
 	sLbls, err := m.MaterializeLabels(ctx, hints, rgi, rr)
 	if err != nil {
 		return nil, fmt.Errorf("error materializing labels: %w", err)
@@ -670,9 +655,6 @@ func (m *Materializer) GetPageRangesForColumn(cc parquet.ColumnChunk, file Parqu
 			}
 		}
 	}
-	if err := m.checkBytesQuota(maps.Keys(pagesToRowsMap), oidx, chunkColumn); err != nil {
-		return nil, err
-	}
 
 	pageRanges := m.CoalescePageRanges(pagesToRowsMap, oidx)
 	return pageRanges, nil
@@ -716,32 +698,4 @@ func (m *Materializer) CoalescePageRanges(pagedIdx map[int][]RowRange, offset pa
 	}
 
 	return r
-}
-
-func (m *Materializer) checkRowCountQuota(rr []RowRange) error {
-	if err := m.rowCountQuota.Reserve(totalRows(rr)); err != nil {
-		return fmt.Errorf("would fetch too many rows: %w", err)
-	}
-	return nil
-}
-
-func (m *Materializer) checkBytesQuota(pages iter.Seq[int], oidx parquet.OffsetIndex, chunkColumn bool) error {
-	total := totalBytes(pages, oidx)
-	if chunkColumn {
-		if err := m.chunkBytesQuota.Reserve(total); err != nil {
-			return fmt.Errorf("would fetch too many chunk bytes: %w", err)
-		}
-	}
-	if err := m.dataBytesQuota.Reserve(total); err != nil {
-		return fmt.Errorf("would fetch too many data bytes: %w", err)
-	}
-	return nil
-}
-
-func totalBytes(pages iter.Seq[int], oidx parquet.OffsetIndex) int64 {
-	res := int64(0)
-	for i := range pages {
-		res += oidx.CompressedPageSize(i)
-	}
-	return res
 }
