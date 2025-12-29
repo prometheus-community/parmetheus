@@ -24,6 +24,7 @@ import (
 	"github.com/parquet-go/parquet-go"
 	"github.com/prometheus/prometheus/model/labels"
 	prom_storage "github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunks"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -116,7 +117,7 @@ func NewMaterializer(s *TSDBSchema,
 	}, nil
 }
 
-// Materialize creates an iterator to reconstruct the ChunkSeries that belong to the specified row ranges (rr).
+// Materialize reconstructs the ChunkSeries that belong to the specified row ranges (rr).
 func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.SelectHints, rgi int, mint, maxt int64, skipChunks bool, rr []RowRange) (ChunkSeriesSetCloser, error) {
 	if err := m.checkRowCountQuota(rr); err != nil {
 		return nil, err
@@ -132,14 +133,31 @@ func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.Sele
 		return NewNoChunksConcreteLabelsSeriesSet(seriesSetLabels), nil
 	}
 
-	chksIter, err := m.MaterializeChunks(ctx, rgi, mint, maxt, rr)
+	chks, err := m.MaterializeChunks(ctx, rgi, mint, maxt, rr)
 	if err != nil {
-		return nil, fmt.Errorf("materializer failed to create chunks iterator: %w", err)
+		return nil, fmt.Errorf("materializer failed to materialize chunks: %w", err)
 	}
 
-	seriesSetIter := NewFilterEmptyChunkSeriesSet(ctx, seriesSetLabels, chksIter, m.materializedSeriesCallback)
+	// Build series with chunks, filtering out series with no chunks
+	results := make([]*ConcreteChunksSeries, 0, len(seriesSetLabels))
+	for i, lbls := range seriesSetLabels {
+		if len(chks[i]) == 0 {
+			continue
+		}
+		series := &ConcreteChunksSeries{
+			lbls: lbls,
+			chks: chks[i],
+		}
+		if err := m.materializedSeriesCallback(ctx, series); err != nil {
+			return nil, err
+		}
+		results = append(results, series)
+	}
 
-	return seriesSetIter, nil
+	return &ConcreteChunksSeriesSet{
+		seriesSet:        results,
+		currentSeriesIdx: -1,
+	}, nil
 }
 
 // FilterSeriesLabels filters series labels based on the callback filter.
@@ -520,57 +538,30 @@ func (m *Materializer) buildColumnMappings(rr []RowRange, columnIndexes []parque
 	return columnToRowRanges, rowRangeToStartIndex, nil
 }
 
-// MaterializeChunks returns an iterator that materializes chunks for the given row ranges lazily.
-func (m *Materializer) MaterializeChunks(ctx context.Context, rgi int, mint, maxt int64, rr []RowRange) (ChunksIteratorIterator, error) {
+// MaterializeChunks materializes chunks for the given row ranges and returns them directly.
+func (m *Materializer) MaterializeChunks(ctx context.Context, rgi int, mint, maxt int64, rr []RowRange) ([][]chunks.Meta, error) {
 	minDataCol := m.s.DataColumIdx(mint)
 	maxDataCol := m.s.DataColumIdx(maxt)
 	rg := m.b.ChunksFile().RowGroups()[rgi]
+	r := make([][]chunks.Meta, totalRows(rr))
 
-	var columnValueIterators []*ColumnValueIterator
 	for i := minDataCol; i <= min(maxDataCol, len(m.dataColToIndex)-1); i++ {
 		cc := rg.ColumnChunks()[m.dataColToIndex[i]]
-		columnValueIter, err := m.materializeColumnIter(ctx, m.b.ChunksFile(), rgi, rr, cc, true)
+		values, err := m.materializeColumnSlice(ctx, m.b.ChunksFile(), rgi, rr, cc, true)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create column value iterator: %w", err)
+			return r, fmt.Errorf("failed to materialize column: %w", err)
 		}
-		columnValueIterators = append(columnValueIterators, columnValueIter)
-	}
-	return &MultiColumnChunksDecodingIterator{
-		mint:                 mint,
-		maxt:                 maxt,
-		columnValueIterators: columnValueIterators,
-		d:                    m.d,
-	}, nil
-}
 
-func (m *Materializer) materializeColumnIter(
-	ctx context.Context,
-	file ParquetFileView,
-	rgi int,
-	rr []RowRange,
-	cc parquet.ColumnChunk,
-	chunkColumn bool,
-) (*ColumnValueIterator, error) {
-	pageRanges, err := m.GetPageRangesForColumn(cc, file, rgi, rr, chunkColumn)
-	if err != nil {
-		return nil, err
-	}
-
-	dictOff, dictSz := file.DictionaryPageBounds(rgi, cc.Column())
-
-	rowRangesValueIterators := make([]*RowRangesValueIterator, len(pageRanges))
-	for i, pageRange := range pageRanges {
-		rowRangesValueIter, err := newRowRangesValueIterator(
-			ctx, file, cc, pageRange, dictOff, dictSz,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create row value iterator for page range: %w", err)
+		for vi, value := range values {
+			chks, err := m.d.Decode(value.ByteArray(), mint, maxt)
+			if err != nil {
+				return r, fmt.Errorf("failed to decode chunks: %w", err)
+			}
+			r[vi] = append(r[vi], chks...)
 		}
-		rowRangesValueIterators[i] = rowRangesValueIter
 	}
-	return &ColumnValueIterator{
-		rowRangesIterators: rowRangesValueIterators,
-	}, nil
+
+	return r, nil
 }
 
 func (m *Materializer) materializeColumnSlice(

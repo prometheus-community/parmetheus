@@ -15,7 +15,6 @@ package promparquet
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 
@@ -54,6 +53,36 @@ type ChunkSeriesSetCloser interface {
 	// underlying ChunkSeries. It is not safe to use the ChunkSeriesSet
 	// or any of its ChunkSeries after calling Close.
 	Close() error
+}
+
+// ConcreteChunksSeriesSet is a series set that iterates over a slice of ConcreteChunksSeries.
+type ConcreteChunksSeriesSet struct {
+	seriesSet        []*ConcreteChunksSeries
+	currentSeriesIdx int
+}
+
+func (s *ConcreteChunksSeriesSet) At() prom_storage.ChunkSeries {
+	return s.seriesSet[s.currentSeriesIdx]
+}
+
+func (s *ConcreteChunksSeriesSet) Next() bool {
+	if s.currentSeriesIdx+1 == len(s.seriesSet) {
+		return false
+	}
+	s.currentSeriesIdx++
+	return true
+}
+
+func (s *ConcreteChunksSeriesSet) Err() error {
+	return nil
+}
+
+func (s *ConcreteChunksSeriesSet) Warnings() annotations.Annotations {
+	return nil
+}
+
+func (s *ConcreteChunksSeriesSet) Close() error {
+	return nil
 }
 
 // NoChunksConcreteLabelsSeriesSet is a series set without chunks.
@@ -96,256 +125,6 @@ func (s *NoChunksConcreteLabelsSeriesSet) Warnings() annotations.Annotations {
 
 func (s *NoChunksConcreteLabelsSeriesSet) Close() error {
 	return nil
-}
-
-// FilterEmptyChunkSeriesSet is a ChunkSeriesSet that lazily filters out series with no chunks.
-type FilterEmptyChunkSeriesSet struct {
-	ctx     context.Context
-	lblsSet []labels.Labels
-	chnkSet ChunksIteratorIterator
-
-	currentSeries              *ConcreteChunksSeries
-	materializedSeriesCallback MaterializedSeriesFunc
-	err                        error
-}
-
-// NewFilterEmptyChunkSeriesSet creates a new filtering series set.
-func NewFilterEmptyChunkSeriesSet(
-	ctx context.Context,
-	lblsSet []labels.Labels,
-	chnkSet ChunksIteratorIterator,
-	materializeSeriesCallback MaterializedSeriesFunc,
-) *FilterEmptyChunkSeriesSet {
-	return &FilterEmptyChunkSeriesSet{
-		ctx:                        ctx,
-		lblsSet:                    lblsSet,
-		chnkSet:                    chnkSet,
-		materializedSeriesCallback: materializeSeriesCallback,
-	}
-}
-
-func (s *FilterEmptyChunkSeriesSet) At() prom_storage.ChunkSeries {
-	return s.currentSeries
-}
-
-func (s *FilterEmptyChunkSeriesSet) Next() bool {
-	metas := make([]chunks.Meta, 0, 128)
-	for s.chnkSet.Next() {
-		if len(s.lblsSet) == 0 {
-			s.err = errors.New("less labels than chunks, this should not happen")
-			return false
-		}
-		lbls := s.lblsSet[0]
-		s.lblsSet = s.lblsSet[1:]
-		iter := s.chnkSet.At()
-		for iter.Next() {
-			metas = append(metas, iter.At())
-		}
-
-		if iter.Err() != nil {
-			s.err = iter.Err()
-			return false
-		}
-
-		if len(metas) == 0 {
-			continue
-		}
-		metasCpy := make([]chunks.Meta, len(metas))
-		copy(metasCpy, metas)
-
-		s.currentSeries = &ConcreteChunksSeries{
-			lbls: lbls,
-			chks: metasCpy,
-		}
-		s.err = s.materializedSeriesCallback(s.ctx, s.currentSeries)
-		return s.err == nil
-	}
-	if s.chnkSet.Err() != nil {
-		s.err = s.chnkSet.Err()
-	}
-	if len(s.lblsSet) > 0 {
-		s.err = errors.New("more labels than chunks, this should not happen")
-	}
-	return false
-}
-
-func (s *FilterEmptyChunkSeriesSet) Err() error {
-	if s.err != nil {
-		return s.err
-	}
-	return s.chnkSet.Err()
-}
-
-func (s *FilterEmptyChunkSeriesSet) Warnings() annotations.Annotations {
-	return nil
-}
-
-func (s *FilterEmptyChunkSeriesSet) Close() error {
-	return s.chnkSet.Close()
-}
-
-// ChunksIteratorIterator iterates over chunks iterators.
-type ChunksIteratorIterator interface {
-	Next() bool
-	At() chunks.Iterator
-	Err() error
-	Close() error
-}
-
-// MultiColumnChunksDecodingIterator yields a prometheus chunks.Iterator from multiple parquet Columns.
-type MultiColumnChunksDecodingIterator struct {
-	mint int64
-	maxt int64
-
-	columnValueIterators []*ColumnValueIterator
-	d                    *PrometheusParquetChunksDecoder
-
-	current *ValueDecodingChunkIterator
-	err     error
-}
-
-func (i *MultiColumnChunksDecodingIterator) At() chunks.Iterator {
-	return i.current
-}
-
-func (i *MultiColumnChunksDecodingIterator) Next() bool {
-	if i.err != nil || len(i.columnValueIterators) == 0 {
-		return false
-	}
-
-	multiColumnValues := make([]parquet.Value, 0, len(i.columnValueIterators))
-	for _, columnValueIter := range i.columnValueIterators {
-		if !columnValueIter.Next() {
-			i.err = columnValueIter.Err()
-			if i.err != nil {
-				return false
-			}
-			continue
-		}
-		at := columnValueIter.At()
-		multiColumnValues = append(multiColumnValues, at)
-	}
-	if len(multiColumnValues) == 0 {
-		return false
-	}
-
-	i.current = &ValueDecodingChunkIterator{
-		mint:   i.mint,
-		maxt:   i.maxt,
-		values: multiColumnValues,
-		d:      i.d,
-	}
-	return true
-}
-
-func (i *MultiColumnChunksDecodingIterator) Err() error {
-	return i.err
-}
-
-func (i *MultiColumnChunksDecodingIterator) Close() error {
-	var errs []error
-	for _, iter := range i.columnValueIterators {
-		if err := iter.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
-}
-
-// ValueDecodingChunkIterator decodes and yields chunks from a parquet Values slice.
-type ValueDecodingChunkIterator struct {
-	mint   int64
-	maxt   int64
-	values []parquet.Value
-	d      *PrometheusParquetChunksDecoder
-
-	decoded []chunks.Meta
-	current chunks.Meta
-	err     error
-}
-
-func (i *ValueDecodingChunkIterator) At() chunks.Meta {
-	return i.current
-}
-
-func (i *ValueDecodingChunkIterator) Next() bool {
-	if i.err != nil {
-		return false
-	}
-	if len(i.values) == 0 && len(i.decoded) == 0 {
-		return false
-	}
-	if len(i.decoded) > 0 {
-		i.current = i.decoded[0]
-		i.decoded = i.decoded[1:]
-		return true
-	}
-	value := i.values[0]
-	i.values = i.values[1:]
-
-	i.decoded, i.err = i.d.Decode(value.ByteArray(), i.mint, i.maxt)
-	return i.Next()
-}
-
-func (i *ValueDecodingChunkIterator) Err() error {
-	return i.err
-}
-
-// ColumnValueIterator iterates over values from multiple row ranges.
-type ColumnValueIterator struct {
-	currentIteratorIndex int
-	rowRangesIterators   []*RowRangesValueIterator
-
-	current parquet.Value
-	err     error
-}
-
-func (i *ColumnValueIterator) At() parquet.Value {
-	return i.current
-}
-
-func (i *ColumnValueIterator) Next() bool {
-	if i.err != nil {
-		return false
-	}
-
-	found := false
-	for !found {
-		if i.currentIteratorIndex >= len(i.rowRangesIterators) {
-			return false
-		}
-
-		currentIterator := i.rowRangesIterators[i.currentIteratorIndex]
-		hasNext := currentIterator.Next()
-
-		if !hasNext {
-			if err := currentIterator.Err(); err != nil {
-				i.err = err
-				_ = currentIterator.Close()
-				return false
-			}
-			_ = currentIterator.Close()
-			i.currentIteratorIndex++
-			continue
-		}
-		i.current = currentIterator.At()
-		found = true
-	}
-	return found
-}
-
-func (i *ColumnValueIterator) Err() error {
-	return i.err
-}
-
-func (i *ColumnValueIterator) Close() error {
-	var errs []error
-	for _, iter := range i.rowRangesIterators {
-		if err := iter.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
 }
 
 // RowRangesValueIterator yields individual parquet Values from specified row ranges in its FilePages.
